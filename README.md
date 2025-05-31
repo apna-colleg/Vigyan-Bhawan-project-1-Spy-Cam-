@@ -1,3 +1,5 @@
+---
+
 Step 1: Hardware Setup
 Connect your ESP32-CAM to CP2102 USB-to-Serial converter:
 
@@ -64,3 +66,5 @@ Copy
 Edit
 http://192.168.1.45/
 You will see the live video stream and motion detection status.
+
+---
