@@ -2,28 +2,20 @@
 #include <WiFi.h>
 #include <ArduinoOTA.h>
 
-#define PIR_SENSOR_PIN 13  // Optional: Connect your PIR sensor output to GPIO 13
+#define PIR_PIN 13  // GPIO pin connected to PIR sensor
 
-const char* ssid = "YOUR_WIFI_SSID";
-const char* password = "YOUR_WIFI_PASSWORD";
+// Replace with your WiFi credentials
+const char* ssid = "YOUR_SSID";
+const char* password = "YOUR_PASSWORD";
 
-// Server and motion detection settings
+// AI Thinker ESP32-CAM pins
+#define CAMERA_MODEL_AI_THINKER
+#include "camera_pins.h"
+
 WiFiServer server(80);
 bool motionDetected = false;
-unsigned long lastCheck = 0;
 
-#define MOTION_THRESHOLD 30
-#define CHECK_INTERVAL 500
-
-camera_fb_t *lastFrame = nullptr;
-
-#include "camera_pins.h" // AI Thinker camera pinout
-
-void setup() {
-  Serial.begin(115200);
-  pinMode(PIR_SENSOR_PIN, INPUT);  // Optional PIR motion sensor
-
-  // Camera configuration
+void startCamera() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -56,54 +48,29 @@ void setup() {
     config.fb_count = 1;
   }
 
-  if(esp_camera_init(&config) != ESP_OK){
-    Serial.println("Camera init failed");
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x", err);
     return;
   }
-
-  // Connect to WiFi
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED){
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nConnected! IP: ");
-  Serial.println(WiFi.localIP());
-
-  server.begin();
-  ArduinoOTA.begin();
-}
-
-bool detectMotion(camera_fb_t* fb) {
-  if (!lastFrame) {
-    lastFrame = esp_camera_fb_get();
-    return false;
-  }
-
-  int diffCount = 0;
-  for (size_t i = 0; i < fb->len && i < lastFrame->len; i += 10) {
-    if (abs(fb->buf[i] - lastFrame->buf[i]) > 10) {
-      diffCount++;
-    }
-  }
-
-  esp_camera_fb_return(lastFrame);
-  lastFrame = esp_camera_fb_get();
-  return diffCount > MOTION_THRESHOLD;
 }
 
 void streamMJPEG(WiFiClient client) {
-  client.println("HTTP/1.1 200 OK");
-  client.println("Content-Type: multipart/x-mixed-replace; boundary=frame");
-  client.println();
+  String header = "HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
+  client.print(header);
 
   while (client.connected()) {
     camera_fb_t * fb = esp_camera_fb_get();
-    if (!fb) continue;
+    if (!fb) {
+      Serial.println("Camera capture failed");
+      break;
+    }
 
-    client.printf("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", fb->len);
+    client.print("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ");
+    client.print(fb->len);
+    client.print("\r\n\r\n");
     client.write(fb->buf, fb->len);
-    client.println();
+    client.print("\r\n");
 
     esp_camera_fb_return(fb);
     delay(100);
@@ -114,35 +81,57 @@ void handleClient() {
   WiFiClient client = server.available();
   if (!client) return;
 
-  String req = client.readStringUntil('\r');
-  if (req.indexOf("GET /stream") >= 0) {
+  Serial.println("Client connected");
+
+  String request = client.readStringUntil('\r');
+  Serial.println(request);
+
+  if (request.indexOf("GET /stream") >= 0) {
     streamMJPEG(client);
   } else {
-    client.println("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n");
-    client.println("<html><body>");
-    client.println("<h1>ESP32-CAM Web Stream</h1>");
-    client.println("<img src=\"/stream\" width=\"640\">");
-    client.print("<p>Motion: ");
-    client.print(motionDetected ? "YES" : "NO");
-    client.println("</p></body></html>");
+    String html = "<html><body>";
+    html += "<h1>ESP32-CAM Stream with PIR Sensor</h1>";
+    html += "<img src=\"/stream\" width=\"640\"/>";
+    html += "<p>Motion: ";
+    html += motionDetected ? "YES" : "NO";
+    html += "</p></body></html>";
+
+    client.print("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n");
+    client.print(html);
   }
+
   client.stop();
+  Serial.println("Client disconnected");
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(PIR_PIN, INPUT);
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("Connected! IP address: ");
+  Serial.println(WiFi.localIP());
+
+  startCamera();
+
+  ArduinoOTA.begin();
+  server.begin();
+  Serial.println("Server started");
 }
 
 void loop() {
   ArduinoOTA.handle();
 
   // Check PIR sensor
-  bool pirTriggered = digitalRead(PIR_SENSOR_PIN) == HIGH;
-
-  // Optional software motion detection
-  if (millis() - lastCheck > CHECK_INTERVAL) {
-    camera_fb_t* fb = esp_camera_fb_get();
-    if (fb) {
-      motionDetected = detectMotion(fb) || pirTriggered;
-      esp_camera_fb_return(fb);
-    }
-    lastCheck = millis();
+  motionDetected = digitalRead(PIR_PIN);
+  if (motionDetected) {
+    Serial.println("Motion detected!");
   }
 
   handleClient();
