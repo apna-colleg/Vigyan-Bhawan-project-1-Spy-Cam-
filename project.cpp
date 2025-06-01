@@ -2,29 +2,28 @@
 #include <WiFi.h>
 #include <ArduinoOTA.h>
 
-// Replace with your WiFi credentials
-const char* ssid = "YOUR_SSID";
-const char* password = "YOUR_PASSWORD";
+#define PIR_SENSOR_PIN 13  // Optional: Connect your PIR sensor output to GPIO 13
 
-// Motion detection settings
-#define MOTION_THRESHOLD 30
-#define MOTION_CHECK_INTERVAL 500  // ms
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
 
-// AI Thinker ESP32-CAM pins
-#define CAMERA_MODEL_AI_THINKER
-#include "camera_pins.h"
-
+// Server and motion detection settings
 WiFiServer server(80);
+bool motionDetected = false;
+unsigned long lastCheck = 0;
+
+#define MOTION_THRESHOLD 30
+#define CHECK_INTERVAL 500
 
 camera_fb_t *lastFrame = nullptr;
-unsigned long lastMotionCheck = 0;
-bool motionDetected = false;
+
+#include "camera_pins.h" // AI Thinker camera pinout
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  pinMode(PIR_SENSOR_PIN, INPUT);  // Optional PIR motion sensor
 
-  // Camera config
+  // Camera configuration
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -47,97 +46,66 @@ void setup() {
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
 
-  if (psramFound()) {
-    config.frame_size = FRAMESIZE_SVGA;  // 800x600
+  if(psramFound()){
+    config.frame_size = FRAMESIZE_SVGA;
     config.jpeg_quality = 10;
     config.fb_count = 2;
   } else {
-    config.frame_size = FRAMESIZE_VGA;   // 640x480
+    config.frame_size = FRAMESIZE_VGA;
     config.jpeg_quality = 12;
     config.fb_count = 1;
   }
 
-  esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) {
-    Serial.printf("Camera init failed with error 0x%x\n", err);
+  if(esp_camera_init(&config) != ESP_OK){
+    Serial.println("Camera init failed");
     return;
   }
 
+  // Connect to WiFi
   WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
+  while (WiFi.status() != WL_CONNECTED){
     delay(500);
     Serial.print(".");
   }
-  Serial.println();
-  Serial.print("Connected! IP: ");
+  Serial.println("\nConnected! IP: ");
   Serial.println(WiFi.localIP());
 
-  // OTA setup
-  ArduinoOTA.onStart([]() {
-    Serial.println("OTA update started");
-  });
-  ArduinoOTA.onEnd([]() {
-    Serial.println("OTA update finished");
-  });
-  ArduinoOTA.onError([](ota_error_t error) {
-    Serial.printf("OTA Error[%u]: ", error);
-    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
-    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
-    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
-    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
-    else if (error == OTA_END_ERROR) Serial.println("End Failed");
-  });
-  ArduinoOTA.begin();
-
   server.begin();
-  Serial.println("Server started");
+  ArduinoOTA.begin();
 }
 
-// Simple motion detection by frame difference
-bool detectMotion(camera_fb_t *currentFrame) {
+bool detectMotion(camera_fb_t* fb) {
   if (!lastFrame) {
     lastFrame = esp_camera_fb_get();
     return false;
   }
 
   int diffCount = 0;
-  int thresholdDiff = 10;
-
-  for (size_t i = 0; i < currentFrame->len && i < lastFrame->len; i += 10) {
-    int diff = abs(currentFrame->buf[i] - lastFrame->buf[i]);
-    if (diff > thresholdDiff) diffCount++;
+  for (size_t i = 0; i < fb->len && i < lastFrame->len; i += 10) {
+    if (abs(fb->buf[i] - lastFrame->buf[i]) > 10) {
+      diffCount++;
+    }
   }
 
   esp_camera_fb_return(lastFrame);
   lastFrame = esp_camera_fb_get();
-
-  Serial.printf("Motion diff count: %d\n", diffCount);
-
   return diffCount > MOTION_THRESHOLD;
 }
 
 void streamMJPEG(WiFiClient client) {
-  String header = "HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
-  client.print(header);
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: multipart/x-mixed-replace; boundary=frame");
+  client.println();
 
   while (client.connected()) {
     camera_fb_t * fb = esp_camera_fb_get();
-    if (!fb) {
-      Serial.println("Camera capture failed");
-      break;
-    }
+    if (!fb) continue;
 
-    client.print("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ");
-    client.print(fb->len);
-    client.print("\r\n\r\n");
+    client.printf("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", fb->len);
     client.write(fb->buf, fb->len);
-    client.print("\r\n");
+    client.println();
 
     esp_camera_fb_return(fb);
-
-    if (!client.connected()) break;
-
     delay(100);
   }
 }
@@ -146,47 +114,35 @@ void handleClient() {
   WiFiClient client = server.available();
   if (!client) return;
 
-  Serial.println("Client connected");
-
-  String request = client.readStringUntil('\r');
-  Serial.print("Request: ");
-  Serial.println(request);
-
-  if (request.indexOf("GET /stream") >= 0) {
+  String req = client.readStringUntil('\r');
+  if (req.indexOf("GET /stream") >= 0) {
     streamMJPEG(client);
   } else {
-    String html = "<html><body>";
-    html += "<h1>ESP32-CAM Stream</h1>";
-    html += "<img src=\"/stream\" width=\"640\"/>";
-    html += "<p>Motion detected: ";
-    html += (motionDetected ? "YES" : "NO");
-    html += "</p></body></html>";
-
-    client.print("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n");
-    client.print(html);
-    client.stop();
+    client.println("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n");
+    client.println("<html><body>");
+    client.println("<h1>ESP32-CAM Web Stream</h1>");
+    client.println("<img src=\"/stream\" width=\"640\">");
+    client.print("<p>Motion: ");
+    client.print(motionDetected ? "YES" : "NO");
+    client.println("</p></body></html>");
   }
-
-  Serial.println("Client disconnected");
+  client.stop();
 }
 
 void loop() {
   ArduinoOTA.handle();
 
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi lost, reconnecting...");
-    WiFi.reconnect();
-    delay(1000);
-    return;
-  }
+  // Check PIR sensor
+  bool pirTriggered = digitalRead(PIR_SENSOR_PIN) == HIGH;
 
-  if (millis() - lastMotionCheck > MOTION_CHECK_INTERVAL) {
-    camera_fb_t *fb = esp_camera_fb_get();
+  // Optional software motion detection
+  if (millis() - lastCheck > CHECK_INTERVAL) {
+    camera_fb_t* fb = esp_camera_fb_get();
     if (fb) {
-      motionDetected = detectMotion(fb);
+      motionDetected = detectMotion(fb) || pirTriggered;
       esp_camera_fb_return(fb);
     }
-    lastMotionCheck = millis();
+    lastCheck = millis();
   }
 
   handleClient();
